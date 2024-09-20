@@ -1,0 +1,165 @@
+#include <Wire.h>
+#include <MS5611.h>
+#include <MPU6050.h>
+#include <SD.h>
+
+MS5611 ms5611;         // instanta pentru MS5611
+MPU6050 mpu;           // instanta pentru MPU6050
+
+const int MQ131_analogPin = A0;  // pin analog MQ-131
+const int chipSelect = 10;       // pin CS pentru SD
+
+File dataFile;
+
+float alpha = 0.9;     // constanta pentru low-pass filter
+float prev_ax = 0, prev_ay = 0, prev_az = 0;  // valori filtrate anterioare acceleratie
+float prev_gx = 0, prev_gy = 0, prev_gz = 0;  // valori filtrate anterioare giroscop
+float anglePitch = 0, angleRoll = 0, angleYaw = 0;
+unsigned long lastTime; // pt. calcul timp intre citiri
+
+// variabile pt transformarea acceleratiilor
+float Acc_cx, Acc_cy, Acc_cz;
+float Acc_x1, Acc_x2, Acc_x3;
+float Acc_y1, Acc_y2, Acc_y3;
+float Acc_z1, Acc_z2, Acc_z3;
+
+void setup() {
+  Serial.begin(115200);  // serial communication pentru debugging
+  Wire.begin();  // I2C communication
+
+  // pornire MS5611
+  if (!ms5611.begin()) {
+    Serial.println("!!Nu s-a gasit MS5611!!");
+    while (1);
+  }
+
+  // pornire MPU6050
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("!!Nu s-a gasit MPU6050!!");
+    while (1);
+  }
+
+  // pornire modul SD
+  if (!SD.begin(chipSelect)) {
+    Serial.println("!!Nu s-a gasit modulul SD!!");
+    while (1);
+  }
+
+  // deschide fisierul pentru scriere
+  dataFile = SD.open("data.txt", FILE_WRITE);
+  if (!dataFile) {
+    Serial.println("Nu s-a putut deschide fisierul data.txt pentru scriere.");
+    while (1);
+  }
+  dataFile.println("Timestamp,Temperatura,Presiune,Valoare MQ-131,Tensiune MQ-131,Acceleratie X,Acceleratie Y,Acceleratie Z,Giroscop X,Giroscop Y,Giroscop Z,Pitch,Roll,Yaw");
+  dataFile.close();
+
+  lastTime = millis();  // initializeaza timpul initial pentru calculul dt
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  float dt = (currentTime - lastTime) / 1000.0; // timpul in secunde
+  lastTime = currentTime;
+
+  // citirea temperaturii si presiunii de la MS5611
+  float temperature = ms5611.readTemperature();
+  float pressure = ms5611.readPressure();
+  
+  // citirea valorii de la MQ-131
+  int mq131_value = analogRead(MQ131_analogPin);
+  float mq131_voltage = mq131_value * (5.0 / 1023.0);
+  
+  // citirea valorilor de la MPU6050
+  int16_t raw_ax, raw_ay, raw_az;
+  int16_t raw_gx, raw_gy, raw_gz;
+  
+  mpu.getAcceleration(&raw_ax, &raw_ay, &raw_az);
+  mpu.getRotation(&raw_gx, &raw_gy, &raw_gz);
+
+  // conversia valorilor brute
+  float ax = raw_ax / 16384.0;
+  float ay = raw_ay / 16384.0;
+  float az = raw_az / 16384.0;
+  
+  float gx = raw_gx / 131.0;
+  float gy = raw_gy / 131.0;
+  float gz = raw_gz / 131.0;
+
+  // aplicare low-pass filter pentru accelerație și giroscop
+  ax = alpha * ax + (1 - alpha) * prev_ax; // Accelerație filtrată
+  ay = alpha * ay + (1 - alpha) * prev_ay;
+  az = alpha * az + (1 - alpha) * prev_az;
+
+  gx = alpha * gx + (1 - alpha) * prev_gx; // Giroscop filtrat
+  gy = alpha * gy + (1 - alpha) * prev_gy;
+  gz = alpha * gz + (1 - alpha) * prev_gz;
+
+  // actualizare valori filtrate anterioare
+  prev_ax = ax;
+  prev_ay = ay;
+  prev_az = az;
+
+  prev_gx = gx;
+  prev_gy = gy;
+  prev_gz = gz;
+
+  // calculul unghiurilor Pitch, Roll, Yaw
+  anglePitch = atan2(ay, az) * 180 / PI;
+  angleRoll = atan2(-ax, sqrt(ay * ay + az * az)) * 180 / PI;
+  angleYaw += gz * dt;  // Integrare pentru Yaw
+
+  // aplicarea formulelor pentru transformarea acceleratiilor
+  Acc_x1 = -ax * sin(angleYaw);
+  Acc_x2 = ax * sin(anglePitch) * cos(angleYaw);
+  Acc_x3 = az * cos(anglePitch) * cos(angleYaw);
+  Acc_cx = Acc_x1 + Acc_x2 + Acc_x3;
+  
+  Acc_y1 = -az * sin(angleRoll);
+  Acc_y2 = ax * sin(angleYaw) * cos(angleRoll);
+  Acc_y3 = ay * cos(angleYaw) * cos(angleRoll);
+  Acc_cy = Acc_y1 + Acc_y2 + Acc_y3;
+  
+  Acc_z1 = -ax * sin(anglePitch) + ay * sin(angleRoll) * cos(anglePitch);
+  Acc_z2 = az * cos(angleRoll) * cos(anglePitch);
+  Acc_z3 = 0;
+  Acc_cz = Acc_z1 + Acc_z2 + Acc_z3;
+
+  // afisarea si stocarea datelor filtrate pe cardul SD
+  dataFile = SD.open("data.txt", FILE_WRITE);
+  if (dataFile) {
+    dataFile.print(millis());  // timestamp (ms)
+    dataFile.print(",");
+    dataFile.print(temperature);
+    dataFile.print(",");
+    dataFile.print(pressure);
+    dataFile.print(",");
+    dataFile.print(mq131_value);
+    dataFile.print(",");
+    dataFile.print(mq131_voltage);
+    dataFile.print(",");
+    dataFile.print(Acc_cx);  // acceleratie X corectata
+    dataFile.print(",");
+    dataFile.print(Acc_cy);  // acceleratie Y corectata
+    dataFile.print(",");
+    dataFile.print(Acc_cz);  // acceleratie Z corectata
+    dataFile.print(",");
+    dataFile.print(gx);
+    dataFile.print(",");
+    dataFile.print(gy);
+    dataFile.print(",");
+    dataFile.print(gz);
+    dataFile.print(",");
+    dataFile.print(anglePitch);
+    dataFile.print(",");
+    dataFile.print(angleRoll);
+    dataFile.print(",");
+    dataFile.println(angleYaw);
+    dataFile.close();  
+  } else {
+    Serial.println("Nu s-a putut deschide fisierul data.txt pentru scriere.");
+  }
+
+  delay(500);  
+}
